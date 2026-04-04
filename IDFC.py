@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import requests
+import gzip
 import os
 import gc
 from io import BytesIO
@@ -9,10 +9,7 @@ from datetime import datetime
 # ============================================================
 # CONFIG
 # ============================================================
-METABASE_BASE = st.secrets.get("metabase_base", "https://metabase.skit.ai")
-QUESTION_UUID = st.secrets.get("question_uuid", "4e3ab1cc-2e49-4b94-ac39-07c7afa84210")
-METABASE_JSON_URL = f"{METABASE_BASE}/api/public/card/{QUESTION_UUID}/query/json"
-BLOCKLIST_DIR = os.path.dirname(os.path.abspath(__file__))
+BLOCKLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocklist.txt.gz")
 
 
 st.set_page_config(page_title="Placement File Filter", page_icon="🔍", layout="centered")
@@ -29,91 +26,31 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_blocklist():
-    """Fetch blocklist — memory efficient: only store the set of numbers, not the full JSON."""
-    errors = []
-
+@st.cache_data(show_spinner=False)
+def load_blocklist_from_file():
+    """Load blocklist from compressed file in repo."""
     try:
-        # Stream the response to avoid loading entire JSON into memory at once
-        resp = requests.get(METABASE_JSON_URL, timeout=300, stream=True)
-        resp.raise_for_status()
-        data = resp.json()
-
-        if isinstance(data, list) and len(data) > 0:
-            # Extract only caller_number, discard everything else immediately
-            first_row = data[0]
-            caller_key = None
-            for key in first_row.keys():
-                if key.strip().lower() in ("caller_number", "caller number"):
-                    caller_key = key
-                    break
-
-            if caller_key:
-                # Build set directly — most memory efficient
-                numbers = set()
-                count = 0
-                for row in data:
-                    val = row.get(caller_key)
-                    if val is not None:
-                        if isinstance(val, float):
-                            val = int(val)
-                        s = str(val).strip()
-                        if s and s.lower() not in ("nan", "none"):
-                            numbers.add(s)
-                    count += 1
-
-                # Free the large JSON list from memory
-                del data
-                gc.collect()
-
-                if numbers:
-                    return numbers, count, "Metabase API (live)", None
-
-        errors.append("JSON endpoint returned 0 usable rows")
-        del data
-        gc.collect()
-
-    except requests.exceptions.Timeout:
-        errors.append("Metabase API timed out (5 min limit)")
-    except requests.exceptions.ConnectionError:
-        errors.append("Cannot connect to Metabase")
-    except MemoryError:
-        errors.append("Not enough memory to load full blocklist from API")
-        gc.collect()
+        with gzip.open(BLOCKLIST_PATH, "rt") as f:
+            numbers = set(line.strip() for line in f if line.strip())
+        return numbers, None
+    except FileNotFoundError:
+        return None, "blocklist.txt.gz not found in repo."
     except Exception as e:
-        errors.append(f"API error: {e}")
-        gc.collect()
+        return None, f"Error reading blocklist: {e}"
 
-    # --- Fallback: Local file ---
-    csv_path = os.path.join(BLOCKLIST_DIR, "blocklist.csv")
-    xlsx_path = os.path.join(BLOCKLIST_DIR, "blocklist.xlsx")
-    fallback_path = csv_path if os.path.exists(csv_path) else (xlsx_path if os.path.exists(xlsx_path) else None)
 
-    if fallback_path:
-        try:
-            if fallback_path.endswith(".csv"):
-                # Read only the caller_number column to save memory
-                df = pd.read_csv(fallback_path, usecols=["caller_number"])
-            else:
-                df = pd.read_excel(fallback_path, usecols=["caller_number"])
-            numbers = set()
-            for val in df["caller_number"]:
-                if val is not None and not (isinstance(val, float) and pd.isna(val)):
-                    if isinstance(val, float):
-                        val = int(val)
-                    s = str(val).strip()
-                    if s and s.lower() not in ("nan", "none"):
-                        numbers.add(s)
-            del df
-            gc.collect()
-            if numbers:
-                mod_time = datetime.fromtimestamp(os.path.getmtime(fallback_path)).strftime("%d %b %Y, %I:%M %p")
-                return numbers, len(numbers), f"Local file (updated {mod_time})", None
-        except Exception as e:
-            errors.append(f"Local file: {e}")
-
-    return None, 0, None, " | ".join(errors)
+def safe_extract_numbers_from_df(df, col):
+    """Extract caller numbers from a dataframe column."""
+    nums = set()
+    for val in df[col]:
+        if val is None or (isinstance(val, float) and pd.isna(val)):
+            continue
+        if isinstance(val, float):
+            val = int(val)
+        s = str(val).strip()
+        if s and s.lower() not in ("nan", "none"):
+            nums.add(s)
+    return nums
 
 
 # ============================================================
@@ -125,35 +62,29 @@ st.divider()
 
 if "blocklist" not in st.session_state:
     st.session_state.blocklist = None
-    st.session_state.bl_count = 0
-    st.session_state.bl_source = None
     st.session_state.bl_error = None
 
 if st.session_state.blocklist is None:
-    with st.spinner("⏳ Fetching blocklist from Metabase (loading 2.6M+ numbers, may take 1-2 min)..."):
-        numbers, count, source, err = fetch_blocklist()
+    with st.spinner("⏳ Loading blocklist..."):
+        numbers, err = load_blocklist_from_file()
     if numbers:
         st.session_state.blocklist = numbers
-        st.session_state.bl_count = count
-        st.session_state.bl_source = source
         st.session_state.bl_error = None
     else:
         st.session_state.bl_error = err
 
 if st.session_state.blocklist:
-    st.success(
-        f"✅ Blocklist active — **{len(st.session_state.blocklist):,}** numbers with 8+ attempts\n\n"
-        f"Source: {st.session_state.bl_source}"
-    )
+    st.success(f"✅ Blocklist active — **{len(st.session_state.blocklist):,}** numbers with 8+ attempts")
+
     col1, col2, _ = st.columns([1, 1, 2])
     with col1:
-        if st.button("🔄 Refresh"):
+        if st.button("🔄 Reload"):
             st.cache_data.clear()
             st.session_state.blocklist = None
             gc.collect()
             st.rerun()
     with col2:
-        if st.button("📁 Upload Instead"):
+        if st.button("📁 Upload New Blocklist"):
             st.session_state.show_manual = True
             st.rerun()
 
@@ -169,25 +100,16 @@ if st.session_state.blocklist:
                 if "caller_number" not in bl_df.columns:
                     st.error(f"'caller_number' not found. Columns: {', '.join(bl_df.columns)}")
                 else:
-                    nums = set()
-                    for val in bl_df["caller_number"]:
-                        if val is not None and not (isinstance(val, float) and pd.isna(val)):
-                            if isinstance(val, float):
-                                val = int(val)
-                            s = str(val).strip()
-                            if s and s.lower() not in ("nan", "none"):
-                                nums.add(s)
+                    nums = safe_extract_numbers_from_df(bl_df, "caller_number")
                     del bl_df
                     gc.collect()
                     st.session_state.blocklist = nums
-                    st.session_state.bl_count = len(nums)
-                    st.session_state.bl_source = "Manual upload"
                     st.session_state.show_manual = False
                     st.rerun()
             except Exception as e:
                 st.error(f"Error: {e}")
 else:
-    st.error(f"❌ Could not load blocklist: {st.session_state.bl_error}")
+    st.error(f"❌ {st.session_state.bl_error}")
     st.info("**Fallback:** Upload the blocklist file exported from Metabase below.")
     fallback_file = st.file_uploader("Upload blocklist CSV/Excel", type=["csv", "xlsx", "xls"], key="fallback_bl")
     if fallback_file:
@@ -198,27 +120,13 @@ else:
             if "caller_number" not in bl_df.columns:
                 st.error(f"'caller_number' not found. Columns: {', '.join(bl_df.columns)}")
                 st.stop()
-            nums = set()
-            for val in bl_df["caller_number"]:
-                if val is not None and not (isinstance(val, float) and pd.isna(val)):
-                    if isinstance(val, float):
-                        val = int(val)
-                    s = str(val).strip()
-                    if s and s.lower() not in ("nan", "none"):
-                        nums.add(s)
+            nums = safe_extract_numbers_from_df(bl_df, "caller_number")
             del bl_df
             gc.collect()
             st.session_state.blocklist = nums
-            st.session_state.bl_count = len(nums)
-            st.session_state.bl_source = "Manual upload"
             st.rerun()
         except Exception as e:
             st.error(f"Error: {e}")
-    if st.button("🔄 Retry Metabase"):
-        st.cache_data.clear()
-        st.session_state.blocklist = None
-        gc.collect()
-        st.rerun()
     st.stop()
 
 # --- PLACEMENT FILE UPLOAD ---
@@ -252,8 +160,6 @@ if uploaded_file:
     total = len(df)
     cleaned = df[~df["_clean"].isin(st.session_state.blocklist)].drop(columns=["_clean"]).copy()
     dropped = total - len(cleaned)
-
-    # Free original df
     del df
     gc.collect()
 
@@ -312,4 +218,4 @@ if uploaded_file:
         st.dataframe(cleaned.head(100), use_container_width=True)
 
 st.markdown("---")
-st.caption("Blocklist refreshes from Metabase every 30 min. Use 'Refresh' for latest or 'Upload Instead' as backup.")
+st.caption("Blocklist auto-updates daily via GitHub Actions. Use 'Upload New Blocklist' for manual override.")
