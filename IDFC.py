@@ -200,7 +200,7 @@ if uploaded_file:
             data=csv_data,
             file_name=f"cleaned_{base_name}_{timestamp}.csv",
             mime="text/csv",
-            use_container_width=True
+            width="stretch"
         )
     with col_xlsx:
         buffer = BytesIO()
@@ -211,11 +211,11 @@ if uploaded_file:
             data=buffer,
             file_name=f"cleaned_{base_name}_{timestamp}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True
+            width="stretch"
         )
 
     with st.expander("👀 Preview cleaned data (first 100 rows)"):
-        st.dataframe(cleaned.head(100), use_container_width=True)
+        st.dataframe(cleaned.head(100), width="stretch")
 
 st.markdown("---")
 st.caption("Blocklist auto-updates daily via GitHub Actions. Use 'Upload New Blocklist' for manual override.")
