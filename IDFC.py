@@ -26,13 +26,20 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(ttl=7200)
 def load_blocklist_from_file():
-    """Load blocklist from compressed file in repo."""
+    """Load blocklist from compressed file — shared across all sessions."""
     try:
+        numbers = set()
         with gzip.open(BLOCKLIST_PATH, "rt") as f:
-            numbers = set(line.strip() for line in f if line.strip())
-        return numbers, None
+            for line in f:
+                num = line.strip()
+                if num:
+                    numbers.add(num)
+        result = frozenset(numbers)
+        del numbers
+        gc.collect()
+        return result, None
     except FileNotFoundError:
         return None, "blocklist.txt.gz not found in repo."
     except Exception as e:
@@ -50,7 +57,7 @@ def safe_extract_numbers_from_df(df, col):
         s = str(val).strip()
         if s and s.lower() not in ("nan", "none"):
             nums.add(s)
-    return nums
+    return frozenset(nums)
 
 
 # ============================================================
@@ -79,7 +86,7 @@ if st.session_state.blocklist:
     col1, col2, _ = st.columns([1, 1, 2])
     with col1:
         if st.button("🔄 Reload"):
-            st.cache_data.clear()
+            st.cache_resource.clear()
             st.session_state.blocklist = None
             gc.collect()
             st.rerun()
@@ -218,4 +225,4 @@ if uploaded_file:
         st.dataframe(cleaned.head(100), width="stretch")
 
 st.markdown("---")
-st.caption("Blocklist auto-updates daily via GitHub Actions. Use 'Upload New Blocklist' for manual override.")
+st.caption("Blocklist auto-updates every 4 hours via GitHub Actions.")
