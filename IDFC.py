@@ -1,14 +1,13 @@
 import streamlit as st
 import pandas as pd
-import sqlite3
-import shutil
+import gzip
 import os
 import gc
+import tempfile
 from io import BytesIO
 from datetime import datetime
 
-REPO_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocklist.db")
-WORK_DB_PATH = "/tmp/blocklist.db"
+BLOCKLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocklist.txt.gz")
 
 st.set_page_config(page_title="Placement File Filter", page_icon="🔍", layout="centered")
 
@@ -24,53 +23,144 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-def get_db():
-    if not os.path.exists(REPO_DB_PATH):
-        return None
-    if not os.path.exists(WORK_DB_PATH) or os.path.getmtime(REPO_DB_PATH) > os.path.getmtime(WORK_DB_PATH):
-        shutil.copy2(REPO_DB_PATH, WORK_DB_PATH)
-    return WORK_DB_PATH
+def get_blocklist_count():
+    try:
+        count = 0
+        with gzip.open(BLOCKLIST_PATH, "rt") as f:
+            for line in f:
+                if line.strip():
+                    count += 1
+        return count, None
+    except FileNotFoundError:
+        return 0, "blocklist.txt.gz not found."
+    except Exception as e:
+        return 0, str(e)
 
 
-def get_count():
-    db = get_db()
-    if not db:
-        return 0
-    conn = sqlite3.connect(db)
-    count = conn.execute("SELECT COUNT(*) FROM blocklist").fetchone()[0]
-    conn.close()
-    return count
+def clean_number(x):
+    if isinstance(x, float) and pd.notna(x) and x == int(x):
+        return str(int(x))
+    elif pd.notna(x):
+        return str(x).strip()
+    return ""
 
 
-def check_blocked(numbers_list):
-    db = get_db()
-    if not db:
-        return set()
-    conn = sqlite3.connect(db)
+def find_blocked_numbers(placement_numbers):
+    """Read blocklist line by line, return only numbers found in placement file."""
     blocked = set()
-    batch_size = 500
-    for i in range(0, len(numbers_list), batch_size):
-        batch = numbers_list[i:i + batch_size]
-        placeholders = ",".join(["?"] * len(batch))
-        rows = conn.execute(
-            f"SELECT caller_number FROM blocklist WHERE caller_number IN ({placeholders})",
-            batch
-        ).fetchall()
-        blocked.update(row[0] for row in rows)
-    conn.close()
+    with gzip.open(BLOCKLIST_PATH, "rt") as f:
+        for line in f:
+            num = line.strip()
+            if num in placement_numbers:
+                blocked.add(num)
     return blocked
 
 
+def process_csv_chunked(uploaded_file):
+    """Process CSV in chunks — low memory."""
+    # Pass 1: Read only caller_number to find unique numbers
+    uploaded_file.seek(0)
+    placement_numbers = set()
+    total_rows = 0
+    for chunk in pd.read_csv(uploaded_file, usecols=["caller_number"], chunksize=50000):
+        chunk.columns = [c.strip() for c in chunk.columns]
+        for val in chunk["caller_number"]:
+            placement_numbers.add(clean_number(val))
+        total_rows += len(chunk)
+    gc.collect()
+
+    # Find blocked numbers
+    blocked = find_blocked_numbers(placement_numbers)
+    del placement_numbers
+    gc.collect()
+
+    # Pass 2: Read full file in chunks, filter, write to temp CSV
+    uploaded_file.seek(0)
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="")
+    header_written = False
+    kept_count = 0
+
+    for chunk in pd.read_csv(uploaded_file, chunksize=50000):
+        chunk.columns = [c.strip() for c in chunk.columns]
+        chunk["_clean"] = chunk["caller_number"].apply(clean_number)
+        kept = chunk[~chunk["_clean"].isin(blocked)].drop(columns=["_clean"])
+        kept.to_csv(tmp, index=False, header=not header_written, mode="a")
+        header_written = True
+        kept_count += len(kept)
+        del chunk, kept
+        gc.collect()
+
+    tmp.close()
+    dropped = total_rows - kept_count
+    del blocked
+    gc.collect()
+
+    return tmp.name, total_rows, kept_count, dropped
+
+
+def process_excel_chunked(uploaded_file):
+    """Process Excel — read caller_number first, then full file in chunks."""
+    # Pass 1: Only caller_number column
+    uploaded_file.seek(0)
+    df_caller = pd.read_excel(uploaded_file, usecols=["caller_number"])
+    df_caller.columns = [c.strip() for c in df_caller.columns]
+    placement_numbers = set(df_caller["caller_number"].apply(clean_number).tolist())
+    total_rows = len(df_caller)
+    del df_caller
+    gc.collect()
+
+    # Find blocked numbers
+    blocked = find_blocked_numbers(placement_numbers)
+    del placement_numbers
+    gc.collect()
+
+    # Pass 2: Full file in chunks
+    uploaded_file.seek(0)
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="")
+    header_written = False
+    kept_count = 0
+
+    # Excel doesn't support chunked reading natively, so read full but filter immediately
+    for chunk_start in range(0, total_rows, 50000):
+        uploaded_file.seek(0)
+        df_chunk = pd.read_excel(
+            uploaded_file,
+            skiprows=range(1, chunk_start + 1) if chunk_start > 0 else None,
+            nrows=50000
+        )
+        df_chunk.columns = [c.strip() for c in df_chunk.columns]
+        df_chunk["_clean"] = df_chunk["caller_number"].apply(clean_number)
+        kept = df_chunk[~df_chunk["_clean"].isin(blocked)].drop(columns=["_clean"])
+        kept.to_csv(tmp, index=False, header=not header_written, mode="a")
+        header_written = True
+        kept_count += len(kept)
+        del df_chunk, kept
+        gc.collect()
+
+    tmp.close()
+    dropped = total_rows - kept_count
+    del blocked
+    gc.collect()
+
+    return tmp.name, total_rows, kept_count, dropped
+
+
+# ============================================================
+# MAIN APP
+# ============================================================
 st.title("🔍 Placement File Filter")
 st.caption("Upload placement file → Remove 8+ attempt numbers → Download clean file")
 st.divider()
 
-db = get_db()
-if not db:
-    st.error("❌ blocklist.db not found. Waiting for GitHub Actions to generate it.")
+if not os.path.exists(BLOCKLIST_PATH):
+    st.error("❌ blocklist.txt.gz not found.")
     st.stop()
 
-count = get_count()
+count, err = get_blocklist_count()
+if err:
+    st.error(f"❌ {err}")
+    st.stop()
+
 st.success(f"✅ Blocklist active — **{count:,}** numbers with 8+ attempts")
 
 st.divider()
@@ -84,30 +174,32 @@ uploaded_file = st.file_uploader(
 
 if uploaded_file:
     file_ext = uploaded_file.name.split(".")[-1].lower()
+
+    # Validate columns
+    uploaded_file.seek(0)
     try:
-        df = pd.read_csv(uploaded_file) if file_ext == "csv" else pd.read_excel(uploaded_file)
+        if file_ext == "csv":
+            test_df = pd.read_csv(uploaded_file, nrows=1)
+        else:
+            test_df = pd.read_excel(uploaded_file, nrows=1)
+        test_df.columns = [c.strip() for c in test_df.columns]
+        if "caller_number" not in test_df.columns:
+            st.error(f"❌ 'caller_number' not found. Your file has: {', '.join(test_df.columns)}")
+            st.stop()
+        del test_df
     except Exception as e:
         st.error(f"❌ Could not read file: {e}")
         st.stop()
 
-    df.columns = [c.strip() for c in df.columns]
-    if "caller_number" not in df.columns:
-        st.error(f"❌ 'caller_number' not found. Your file has: {', '.join(df.columns)}")
-        st.stop()
-
-    with st.spinner("⏳ Filtering placement file..."):
-        df["_clean"] = df["caller_number"].apply(
-            lambda x: str(int(x)) if isinstance(x, float) and pd.notna(x) and x == int(x)
-            else (str(x).strip() if pd.notna(x) else "")
-        )
-
-        blocked = check_blocked(df["_clean"].tolist())
-        total = len(df)
-        cleaned = df[~df["_clean"].isin(blocked)].drop(columns=["_clean"]).copy()
-        dropped = total - len(cleaned)
-
-    del df
-    gc.collect()
+    with st.spinner("⏳ Filtering placement file (may take 30-60 seconds for large files)..."):
+        try:
+            if file_ext == "csv":
+                tmp_path, total, kept_count, dropped = process_csv_chunked(uploaded_file)
+            else:
+                tmp_path, total, kept_count, dropped = process_excel_chunked(uploaded_file)
+        except Exception as e:
+            st.error(f"❌ Error processing file: {e}")
+            st.stop()
 
     st.divider()
     st.subheader("📊 Results")
@@ -120,7 +212,7 @@ if uploaded_file:
         </div>""", unsafe_allow_html=True)
     with col2:
         st.markdown(f"""<div class="metric-card">
-            <div class="metric-value" style="color: #28a745;">{len(cleaned):,}</div>
+            <div class="metric-value" style="color: #28a745;">{kept_count:,}</div>
             <div class="metric-label">Kept ✓</div>
         </div>""", unsafe_allow_html=True)
     with col3:
@@ -138,9 +230,12 @@ if uploaded_file:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_name = uploaded_file.name.rsplit(".", 1)[0]
 
+    # Read the temp file for download
+    with open(tmp_path, "rb") as f:
+        csv_data = f.read()
+
     col_csv, col_xlsx = st.columns(2)
     with col_csv:
-        csv_data = cleaned.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="⬇️ Download as CSV",
             data=csv_data,
@@ -149,9 +244,13 @@ if uploaded_file:
             use_container_width=True
         )
     with col_xlsx:
+        # Convert temp CSV to Excel
+        df_out = pd.read_csv(tmp_path)
         buffer = BytesIO()
-        cleaned.to_excel(buffer, index=False, engine="openpyxl")
+        df_out.to_excel(buffer, index=False, engine="openpyxl")
         buffer.seek(0)
+        del df_out
+        gc.collect()
         st.download_button(
             label="⬇️ Download as Excel",
             data=buffer,
@@ -160,8 +259,17 @@ if uploaded_file:
             use_container_width=True
         )
 
+    # Preview
     with st.expander("👀 Preview cleaned data (first 100 rows)"):
-        st.dataframe(cleaned.head(100), use_container_width=True)
+        preview = pd.read_csv(tmp_path, nrows=100)
+        st.dataframe(preview, use_container_width=True)
+        del preview
+
+    # Cleanup temp file
+    try:
+        os.unlink(tmp_path)
+    except:
+        pass
 
 st.markdown("---")
 st.caption("Blocklist auto-updates every 4 hours via GitHub Actions.")
