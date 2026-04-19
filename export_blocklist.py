@@ -1,8 +1,9 @@
 import requests
-import gzip
+import sqlite3
 import os
 
 URL = "https://metabase.skit.ai/api/public/card/4e3ab1cc-2e49-4b94-ac39-07c7afa84210/query/json"
+DB_PATH = "blocklist.db"
 
 print("Fetching from Metabase...")
 resp = requests.get(URL, timeout=300)
@@ -10,7 +11,6 @@ resp.raise_for_status()
 data = resp.json()
 print(f"Got {len(data)} rows")
 
-# Find caller_number key
 first_row = data[0]
 caller_key = None
 for key in first_row.keys():
@@ -18,7 +18,6 @@ for key in first_row.keys():
         caller_key = key
         break
 
-# Extract numbers
 numbers = set()
 for row in data:
     val = row.get(caller_key)
@@ -31,9 +30,16 @@ for row in data:
 
 print(f"Extracted {len(numbers)} unique numbers")
 
-# Save compressed
-with gzip.open("blocklist.txt.gz", "wt") as f:
-    f.write("\n".join(sorted(numbers)))
+if os.path.exists(DB_PATH):
+    os.remove(DB_PATH)
 
-size_mb = os.path.getsize("blocklist.txt.gz") / (1024 * 1024)
-print(f"Saved blocklist.txt.gz ({size_mb:.1f} MB)")
+conn = sqlite3.connect(DB_PATH)
+c = conn.cursor()
+c.execute("CREATE TABLE blocklist (caller_number TEXT PRIMARY KEY)")
+c.executemany("INSERT INTO blocklist VALUES (?)", [(n,) for n in numbers])
+conn.commit()
+count = c.execute("SELECT COUNT(*) FROM blocklist").fetchone()[0]
+conn.close()
+
+size_mb = os.path.getsize(DB_PATH) / (1024 * 1024)
+print(f"Saved blocklist.db ({size_mb:.1f} MB, {count} numbers)")
