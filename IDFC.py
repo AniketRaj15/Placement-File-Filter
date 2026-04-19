@@ -1,16 +1,14 @@
 import streamlit as st
 import pandas as pd
-import gzip
+import sqlite3
+import shutil
 import os
 import gc
 from io import BytesIO
 from datetime import datetime
 
-# ============================================================
-# CONFIG
-# ============================================================
-BLOCKLIST_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocklist.txt.gz")
-
+REPO_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "blocklist.db")
+WORK_DB_PATH = "/tmp/blocklist.db"
 
 st.set_page_config(page_title="Placement File Filter", page_icon="🔍", layout="centered")
 
@@ -26,117 +24,55 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
-@st.cache_resource(ttl=7200)
-def load_blocklist_from_file():
-    """Load blocklist from compressed file — shared across all sessions."""
-    try:
-        numbers = set()
-        with gzip.open(BLOCKLIST_PATH, "rt") as f:
-            for line in f:
-                num = line.strip()
-                if num:
-                    numbers.add(num)
-        result = frozenset(numbers)
-        del numbers
-        gc.collect()
-        return result, None
-    except FileNotFoundError:
-        return None, "blocklist.txt.gz not found in repo."
-    except Exception as e:
-        return None, f"Error reading blocklist: {e}"
+def get_db():
+    if not os.path.exists(REPO_DB_PATH):
+        return None
+    if not os.path.exists(WORK_DB_PATH) or os.path.getmtime(REPO_DB_PATH) > os.path.getmtime(WORK_DB_PATH):
+        shutil.copy2(REPO_DB_PATH, WORK_DB_PATH)
+    return WORK_DB_PATH
 
 
-def safe_extract_numbers_from_df(df, col):
-    """Extract caller numbers from a dataframe column."""
-    nums = set()
-    for val in df[col]:
-        if val is None or (isinstance(val, float) and pd.isna(val)):
-            continue
-        if isinstance(val, float):
-            val = int(val)
-        s = str(val).strip()
-        if s and s.lower() not in ("nan", "none"):
-            nums.add(s)
-    return frozenset(nums)
+def get_count():
+    db = get_db()
+    if not db:
+        return 0
+    conn = sqlite3.connect(db)
+    count = conn.execute("SELECT COUNT(*) FROM blocklist").fetchone()[0]
+    conn.close()
+    return count
 
 
-# ============================================================
-# MAIN APP
-# ============================================================
+def check_blocked(numbers_list):
+    db = get_db()
+    if not db:
+        return set()
+    conn = sqlite3.connect(db)
+    blocked = set()
+    batch_size = 500
+    for i in range(0, len(numbers_list), batch_size):
+        batch = numbers_list[i:i + batch_size]
+        placeholders = ",".join(["?"] * len(batch))
+        rows = conn.execute(
+            f"SELECT caller_number FROM blocklist WHERE caller_number IN ({placeholders})",
+            batch
+        ).fetchall()
+        blocked.update(row[0] for row in rows)
+    conn.close()
+    return blocked
+
+
 st.title("🔍 Placement File Filter")
 st.caption("Upload placement file → Remove 8+ attempt numbers → Download clean file")
 st.divider()
 
-if "blocklist" not in st.session_state:
-    st.session_state.blocklist = None
-    st.session_state.bl_error = None
-
-if st.session_state.blocklist is None:
-    with st.spinner("⏳ Loading blocklist..."):
-        numbers, err = load_blocklist_from_file()
-    if numbers:
-        st.session_state.blocklist = numbers
-        st.session_state.bl_error = None
-    else:
-        st.session_state.bl_error = err
-
-if st.session_state.blocklist:
-    st.success(f"✅ Blocklist active — **{len(st.session_state.blocklist):,}** numbers with 8+ attempts")
-
-    col1, col2, _ = st.columns([1, 1, 2])
-    with col1:
-        if st.button("🔄 Reload"):
-            st.cache_resource.clear()
-            st.session_state.blocklist = None
-            gc.collect()
-            st.rerun()
-    with col2:
-        if st.button("📁 Upload New Blocklist"):
-            st.session_state.show_manual = True
-            st.rerun()
-
-    if st.session_state.get("show_manual"):
-        st.divider()
-        st.caption("Upload a fresh blocklist export from Metabase to override.")
-        manual_file = st.file_uploader("Upload blocklist CSV/Excel", type=["csv", "xlsx", "xls"], key="manual_bl")
-        if manual_file:
-            ext = manual_file.name.split(".")[-1].lower()
-            try:
-                bl_df = pd.read_csv(manual_file) if ext == "csv" else pd.read_excel(manual_file)
-                bl_df.columns = [c.strip().lower() for c in bl_df.columns]
-                if "caller_number" not in bl_df.columns:
-                    st.error(f"'caller_number' not found. Columns: {', '.join(bl_df.columns)}")
-                else:
-                    nums = safe_extract_numbers_from_df(bl_df, "caller_number")
-                    del bl_df
-                    gc.collect()
-                    st.session_state.blocklist = nums
-                    st.session_state.show_manual = False
-                    st.rerun()
-            except Exception as e:
-                st.error(f"Error: {e}")
-else:
-    st.error(f"❌ {st.session_state.bl_error}")
-    st.info("**Fallback:** Upload the blocklist file exported from Metabase below.")
-    fallback_file = st.file_uploader("Upload blocklist CSV/Excel", type=["csv", "xlsx", "xls"], key="fallback_bl")
-    if fallback_file:
-        ext = fallback_file.name.split(".")[-1].lower()
-        try:
-            bl_df = pd.read_csv(fallback_file) if ext == "csv" else pd.read_excel(fallback_file)
-            bl_df.columns = [c.strip().lower() for c in bl_df.columns]
-            if "caller_number" not in bl_df.columns:
-                st.error(f"'caller_number' not found. Columns: {', '.join(bl_df.columns)}")
-                st.stop()
-            nums = safe_extract_numbers_from_df(bl_df, "caller_number")
-            del bl_df
-            gc.collect()
-            st.session_state.blocklist = nums
-            st.rerun()
-        except Exception as e:
-            st.error(f"Error: {e}")
+db = get_db()
+if not db:
+    st.error("❌ blocklist.db not found. Waiting for GitHub Actions to generate it.")
     st.stop()
 
-# --- PLACEMENT FILE UPLOAD ---
+count = get_count()
+st.success(f"✅ Blocklist active — **{count:,}** numbers with 8+ attempts")
+
 st.divider()
 st.subheader("📁 Upload Placement File")
 uploaded_file = st.file_uploader(
@@ -159,14 +95,17 @@ if uploaded_file:
         st.error(f"❌ 'caller_number' not found. Your file has: {', '.join(df.columns)}")
         st.stop()
 
-    df["_clean"] = df["caller_number"].apply(
-        lambda x: str(int(x)) if isinstance(x, float) and pd.notna(x) and x == int(x)
-        else (str(x).strip() if pd.notna(x) else "")
-    )
+    with st.spinner("⏳ Filtering placement file..."):
+        df["_clean"] = df["caller_number"].apply(
+            lambda x: str(int(x)) if isinstance(x, float) and pd.notna(x) and x == int(x)
+            else (str(x).strip() if pd.notna(x) else "")
+        )
 
-    total = len(df)
-    cleaned = df[~df["_clean"].isin(st.session_state.blocklist)].drop(columns=["_clean"]).copy()
-    dropped = total - len(cleaned)
+        blocked = check_blocked(df["_clean"].tolist())
+        total = len(df)
+        cleaned = df[~df["_clean"].isin(blocked)].drop(columns=["_clean"]).copy()
+        dropped = total - len(cleaned)
+
     del df
     gc.collect()
 
