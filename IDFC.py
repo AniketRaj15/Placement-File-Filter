@@ -51,8 +51,8 @@ def clean_number(x):
     return ""
 
 
-def process_csv_chunked(uploaded_file, blocklist):
-    """Process CSV in chunks — only one chunk in memory at a time."""
+def process_csv(uploaded_file, blocklist):
+    """Process CSV in chunks — fast and memory efficient."""
     uploaded_file.seek(0)
     tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="")
     header_written = False
@@ -75,31 +75,36 @@ def process_csv_chunked(uploaded_file, blocklist):
     return tmp.name, total_rows, kept_count, dropped
 
 
-def process_excel_chunked(uploaded_file, blocklist):
-    """Process Excel in chunks."""
+def process_excel(uploaded_file, blocklist):
+    """Process Excel — two pass approach for speed."""
+    # Pass 1: Read only caller_number to find blocked rows
+    uploaded_file.seek(0)
+    df_caller = pd.read_excel(uploaded_file, usecols=["caller_number"])
+    df_caller.columns = [c.strip() for c in df_caller.columns]
+    df_caller["_clean"] = df_caller["caller_number"].apply(clean_number)
+    blocked_rows = df_caller["_clean"].isin(blocklist)
+    keep_indices = df_caller.index[~blocked_rows].tolist()
+    total_rows = len(df_caller)
+    dropped = int(blocked_rows.sum())
+    kept_count = total_rows - dropped
+    del df_caller, blocked_rows
+    gc.collect()
+
+    # Pass 2: Read full file, keep only non-blocked rows
     uploaded_file.seek(0)
     df = pd.read_excel(uploaded_file)
     df.columns = [c.strip() for c in df.columns]
-    total_rows = len(df)
-
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="")
-    header_written = False
-    kept_count = 0
-
-    for start in range(0, total_rows, 50000):
-        chunk = df.iloc[start:start + 50000].copy()
-        chunk["_clean"] = chunk["caller_number"].apply(clean_number)
-        kept = chunk[~chunk["_clean"].isin(blocklist)].drop(columns=["_clean"])
-        kept.to_csv(tmp, index=False, header=not header_written, mode="a")
-        header_written = True
-        kept_count += len(kept)
-        del chunk, kept
-        gc.collect()
-
+    cleaned = df.iloc[keep_indices]
     del df
     gc.collect()
+
+    # Write to temp file
+    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="")
+    cleaned.to_csv(tmp, index=False)
     tmp.close()
-    dropped = total_rows - kept_count
+    del cleaned
+    gc.collect()
+
     return tmp.name, total_rows, kept_count, dropped
 
 
@@ -121,8 +126,16 @@ if err:
 
 st.success(f"✅ Blocklist active — **{len(blocklist):,}** numbers with 8+ attempts")
 
+col1, col2, _ = st.columns([1, 1, 2])
+with col1:
+    if st.button("🔄 Reload Blocklist"):
+        st.cache_resource.clear()
+        gc.collect()
+        st.rerun()
+
 st.divider()
 st.subheader("📁 Upload Placement File")
+st.caption("💡 **Tip:** CSV files process 5-10x faster than Excel. Save as CSV for best performance.")
 uploaded_file = st.file_uploader(
     "Drop your CSV or Excel file here",
     type=["csv", "xlsx", "xls"],
@@ -152,9 +165,9 @@ if uploaded_file:
     with st.spinner("⏳ Filtering placement file..."):
         try:
             if file_ext == "csv":
-                tmp_path, total, kept_count, dropped = process_csv_chunked(uploaded_file, blocklist)
+                tmp_path, total, kept_count, dropped = process_csv(uploaded_file, blocklist)
             else:
-                tmp_path, total, kept_count, dropped = process_excel_chunked(uploaded_file, blocklist)
+                tmp_path, total, kept_count, dropped = process_excel(uploaded_file, blocklist)
         except Exception as e:
             st.error(f"❌ Error processing file: {e}")
             st.stop()
