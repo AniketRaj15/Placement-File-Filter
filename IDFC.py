@@ -49,32 +49,39 @@ def clean_number(x):
     elif pd.notna(x):
         return str(x).strip()
     return ""
-
-
 def process_csv(uploaded_file, blocklist):
-    """Process CSV in chunks — fast and memory efficient."""
-    uploaded_file.seek(0)
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="")
+    """Process CSV in chunks — save to disk first for speed."""
+    # Save uploaded file to disk first (much faster than reading from buffer)
+    input_tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
+    input_tmp.write(uploaded_file.getvalue())
+    input_tmp.close()
+
+    output_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="")
     header_written = False
     total_rows = 0
     kept_count = 0
 
-    for chunk in pd.read_csv(uploaded_file, chunksize=50000):
+    for chunk in pd.read_csv(input_tmp.name, chunksize=50000, dtype={"caller_number": str}):
         chunk.columns = [c.strip() for c in chunk.columns]
         chunk["_clean"] = chunk["caller_number"].apply(clean_number)
         kept = chunk[~chunk["_clean"].isin(blocklist)].drop(columns=["_clean"])
-        kept.to_csv(tmp, index=False, header=not header_written, mode="a")
+        kept.to_csv(output_tmp, index=False, header=not header_written, mode="a")
         header_written = True
         total_rows += len(chunk)
         kept_count += len(kept)
         del chunk, kept
         gc.collect()
 
-    tmp.close()
+    output_tmp.close()
     dropped = total_rows - kept_count
-    return tmp.name, total_rows, kept_count, dropped
 
+    # Cleanup input temp file
+    try:
+        os.unlink(input_tmp.name)
+    except:
+        pass
 
+    return output_tmp.name, total_rows, kept_count, dropped
 def process_excel(uploaded_file, blocklist):
     """Process Excel — two pass approach for speed."""
     # Pass 1: Read only caller_number to find blocked rows
