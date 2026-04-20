@@ -3,7 +3,6 @@ import pandas as pd
 import gzip
 import os
 import gc
-import tempfile
 from io import BytesIO
 from datetime import datetime
 
@@ -49,77 +48,40 @@ def clean_number(x):
     elif pd.notna(x):
         return str(x).strip()
     return ""
-def process_csv(uploaded_file, blocklist):
-    """Process CSV in chunks — save to disk first for speed."""
-    # Save uploaded file to disk first (much faster than reading from buffer)
-    input_tmp = tempfile.NamedTemporaryFile(suffix=".csv", delete=False)
-    input_tmp.write(uploaded_file.getvalue())
-    input_tmp.close()
 
-    output_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="")
-    header_written = False
-    total_rows = 0
-    kept_count = 0
 
-    for chunk in pd.read_csv(input_tmp.name, chunksize=50000, dtype={"caller_number": str}):
-        chunk.columns = [c.strip() for c in chunk.columns]
-        chunk["_clean"] = chunk["caller_number"].apply(clean_number)
-        kept = chunk[~chunk["_clean"].isin(blocklist)].drop(columns=["_clean"])
-        kept.to_csv(output_tmp, index=False, header=not header_written, mode="a")
-        header_written = True
-        total_rows += len(chunk)
-        kept_count += len(kept)
-        del chunk, kept
-        gc.collect()
-
-    output_tmp.close()
-    dropped = total_rows - kept_count
-
-    # Cleanup input temp file
-    try:
-        os.unlink(input_tmp.name)
-    except:
-        pass
-
-    return output_tmp.name, total_rows, kept_count, dropped
-def process_excel(uploaded_file, blocklist):
-    """Process Excel — two pass approach for speed."""
-    # Pass 1: Read only caller_number to find blocked rows
+def process_file(uploaded_file, file_ext, blocklist):
+    """Read only caller_number column, filter, return clean numbers."""
     uploaded_file.seek(0)
-    df_caller = pd.read_excel(uploaded_file, usecols=["caller_number"])
-    df_caller.columns = [c.strip() for c in df_caller.columns]
-    df_caller["_clean"] = df_caller["caller_number"].apply(clean_number)
-    blocked_rows = df_caller["_clean"].isin(blocklist)
-    keep_indices = df_caller.index[~blocked_rows].tolist()
-    total_rows = len(df_caller)
-    dropped = int(blocked_rows.sum())
-    kept_count = total_rows - dropped
-    del df_caller, blocked_rows
-    gc.collect()
 
-    # Pass 2: Read full file, keep only non-blocked rows
-    uploaded_file.seek(0)
-    df = pd.read_excel(uploaded_file)
+    if file_ext == "csv":
+        df = pd.read_csv(uploaded_file, usecols=["caller_number"], dtype={"caller_number": str})
+    else:
+        df = pd.read_excel(uploaded_file, usecols=["caller_number"])
+
     df.columns = [c.strip() for c in df.columns]
-    cleaned = df.iloc[keep_indices]
+    df["_clean"] = df["caller_number"].apply(clean_number)
+
+    total = len(df)
+    kept = df[~df["_clean"].isin(blocklist)]["_clean"].tolist()
+    dropped = total - len(kept)
+
     del df
     gc.collect()
 
-    # Write to temp file
-    tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, newline="")
-    cleaned.to_csv(tmp, index=False)
-    tmp.close()
-    del cleaned
+    # Create clean output
+    result_df = pd.DataFrame({"caller_number": kept})
+    del kept
     gc.collect()
 
-    return tmp.name, total_rows, kept_count, dropped
+    return result_df, total, len(result_df), dropped
 
 
 # ============================================================
 # MAIN APP
 # ============================================================
 st.title("🔍 Placement File Filter")
-st.caption("Upload placement file → Remove 8+ attempt numbers → Download clean file")
+st.caption("Upload placement file → Remove 8+ attempt numbers → Download clean caller numbers")
 st.divider()
 
 if not os.path.exists(BLOCKLIST_PATH):
@@ -142,7 +104,7 @@ with col1:
 
 st.divider()
 st.subheader("📁 Upload Placement File")
-st.caption("💡 **Tip:** CSV files process 5-10x faster than Excel. Save as CSV for best performance.")
+st.caption("The app reads only the **caller_number** column, filters out 8+ attempt numbers, and returns clean caller numbers.")
 uploaded_file = st.file_uploader(
     "Drop your CSV or Excel file here",
     type=["csv", "xlsx", "xls"],
@@ -171,10 +133,7 @@ if uploaded_file:
 
     with st.spinner("⏳ Filtering placement file..."):
         try:
-            if file_ext == "csv":
-                tmp_path, total, kept_count, dropped = process_csv(uploaded_file, blocklist)
-            else:
-                tmp_path, total, kept_count, dropped = process_excel(uploaded_file, blocklist)
+            result_df, total, kept_count, dropped = process_file(uploaded_file, file_ext, blocklist)
         except Exception as e:
             st.error(f"❌ Error processing file: {e}")
             st.stop()
@@ -208,42 +167,42 @@ if uploaded_file:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_name = uploaded_file.name.rsplit(".", 1)[0]
 
-    with open(tmp_path, "rb") as f:
-        csv_data = f.read()
+    csv_data = result_df.to_csv(index=False).encode("utf-8")
 
     col_csv, col_xlsx = st.columns(2)
     with col_csv:
         st.download_button(
-            label="⬇️ Download as CSV",
+            label="⬇️ Download Clean Numbers (CSV)",
             data=csv_data,
-            file_name=f"cleaned_{base_name}_{timestamp}.csv",
+            file_name=f"clean_numbers_{base_name}_{timestamp}.csv",
             mime="text/csv",
             use_container_width=True
         )
     with col_xlsx:
-        df_out = pd.read_csv(tmp_path)
         buffer = BytesIO()
-        df_out.to_excel(buffer, index=False, engine="openpyxl")
+        result_df.to_excel(buffer, index=False, engine="openpyxl")
         buffer.seek(0)
-        del df_out
-        gc.collect()
         st.download_button(
-            label="⬇️ Download as Excel",
+            label="⬇️ Download Clean Numbers (Excel)",
             data=buffer,
-            file_name=f"cleaned_{base_name}_{timestamp}.xlsx",
+            file_name=f"clean_numbers_{base_name}_{timestamp}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
 
-    with st.expander("👀 Preview cleaned data (first 100 rows)"):
-        preview = pd.read_csv(tmp_path, nrows=100)
+    del result_df
+    gc.collect()
+
+    with st.expander("👀 Preview clean numbers (first 100)"):
+        preview = pd.read_csv(BytesIO(csv_data), nrows=100)
         st.dataframe(preview, use_container_width=True)
         del preview
 
-    try:
-        os.unlink(tmp_path)
-    except:
-        pass
+    st.divider()
+    st.info(
+        "📋 **Next step:** Use the downloaded clean numbers file to filter your original placement file.\n\n"
+        "In Excel: Use VLOOKUP or FILTER to keep only rows where caller_number exists in the clean numbers file."
+    )
 
 st.markdown("---")
 st.caption("Blocklist auto-updates every 4 hours via GitHub Actions.")
